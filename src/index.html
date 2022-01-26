@@ -1,0 +1,548 @@
+<html>
+    <head>
+        <link rel="stylesheet" href="style.css" />
+        <script id="vertex-shader" type="x-shader/x-vertex">
+            #version 300 es
+
+            precision highp float;
+
+            in vec3 a_position;
+            in vec2 a_uv;
+            in vec4 a_vertex_color;
+            in vec4 a_skin_weight;
+            in ivec4 a_skin_index;
+
+            out vec2 v_uv;
+            out vec4 v_vertex_color;
+
+            uniform mat4 u_projection;
+            uniform mat4 u_view;
+            uniform mat4 u_model;
+
+            uniform bool u_has_bones;
+            uniform mat4 u_bone_matrices[128];
+
+            void main() {
+                vec4 world_position;
+                if (u_has_bones) {
+                    vec4 sum = vec4(0);
+                    for (int i = 0; i < 4; i++) {
+                        int bone_index = a_skin_index[i];
+                        float bone_weight = a_skin_weight[i];
+                        sum += u_bone_matrices[bone_index] * vec4(a_position, 1) * bone_weight;
+                    }
+                    world_position = sum;
+                } else {
+                    world_position = u_model * vec4(a_position, 1);
+                }
+                gl_Position = u_projection * u_view * world_position;
+                v_uv = a_uv;
+                v_vertex_color = a_vertex_color;
+            }
+        </script>
+        <script id="fragment-shader" type="x-shader/x-fragment">
+            #version 300 es
+
+            precision highp float;
+
+            in vec2 v_uv;
+            in vec4 v_vertex_color;
+
+            out vec4 g_color;
+
+            uniform bool u_has_vertex_color;
+
+            uniform vec4 u_color;
+            uniform bool u_has_texture;
+            uniform sampler2D u_texture;
+
+            uniform float u_min_alpha;
+            uniform float u_max_alpha;
+
+            void main() {
+                vec4 color = u_color;
+                if (u_has_vertex_color) {
+                    color *= v_vertex_color;
+                }
+                if (u_has_texture) {
+                    color *= texture(u_texture, v_uv);
+                }
+                if (color.w < u_min_alpha || color.w > u_max_alpha) {
+                    discard;
+                }
+                g_color = color;
+            }
+        </script>
+    </head>
+    <body>
+        <canvas id="canvas" style="width: 100%; height: 100%"></canvas>
+        <div style="position: absolute; left: 0; top: 0">
+            <select id="model-selection"></select>
+        </div>
+        <script type="module">
+            import * as THREE from 'https://cdn.skypack.dev/three@0.136.0';
+            import { vec3, quat, mat3, mat4 } from 'https://unpkg.com/gl-matrix@3.1.0/esm/index.js';
+            import { createProgram, gltfBufferToArray, newGltfLoader } from './helper.js';
+
+            const canvas = document.getElementById('canvas');
+            /**
+             * @type {WebGL2RenderingContext}
+             */
+            const gl = canvas.getContext('webgl2', { alpha: false });
+
+            const program = createProgram(gl, 'vertex-shader', 'fragment-shader');
+            const projectionUniform = gl.getUniformLocation(program, 'u_projection');
+            const viewUniform = gl.getUniformLocation(program, 'u_view');
+            const modelUniform = gl.getUniformLocation(program, 'u_model');
+            const colorUniform = gl.getUniformLocation(program, 'u_color');
+            const hasVertexColorUniform = gl.getUniformLocation(program, 'u_has_vertex_color');
+            const hasTextureUniform = gl.getUniformLocation(program, 'u_has_texture');
+            const textureUniform = gl.getUniformLocation(program, 'u_texture');
+            const minAlphaUniform = gl.getUniformLocation(program, 'u_min_alpha');
+            const maxAlphaUniform = gl.getUniformLocation(program, 'u_max_alpha');
+            const hasBonesUniform = gl.getUniformLocation(program, 'u_has_bones');
+            const boneMatricesUniform = gl.getUniformLocation(program, 'u_bone_matrices');
+            gl.useProgram(program);
+
+            class Geometry {
+                constructor(gltfGeometry) {
+                    // One vertex array for one geometry.
+                    const vertexArray = gl.createVertexArray();
+                    gl.bindVertexArray(vertexArray);
+
+                    const positionLocation = Geometry.fillFloatVertexArray('a_position', gltfBufferToArray(gltfGeometry.attributes.position), 3);
+                    const uvLocation = Geometry.fillFloatVertexArray('a_uv', gltfBufferToArray(gltfGeometry.attributes.uv), 2);
+                    const colorLocation = Geometry.fillFloatVertexArray('a_vertex_color', gltfBufferToArray(gltfGeometry.attributes.color), 4);
+                    const skinIndexLocation = Geometry.fillIntVertexArray('a_skin_index', gltfBufferToArray(gltfGeometry.attributes.skinIndex), 4);
+                    const skinWeightLocation = Geometry.fillFloatVertexArray(
+                        'a_skin_weight',
+                        gltfBufferToArray(gltfGeometry.attributes.skinWeight),
+                        4
+                    );
+
+                    // Indices.
+                    const indexBuffer = gl.createBuffer();
+                    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+                    const indices = gltfBufferToArray(gltfGeometry.index);
+                    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+
+                    this.vertexArray = vertexArray;
+                    this.indexCount = indices.length;
+                    this.positionLocation = positionLocation;
+                    this.uvLocation = uvLocation;
+                    this.colorLocation = colorLocation;
+                    this.skinIndexLocation = skinIndexLocation;
+                    this.skinWeightLocation = skinWeightLocation;
+                }
+
+                static fillFloatVertexArray(name, data, itemSize) {
+                    if (!data) {
+                        return -1;
+                    }
+                    const buffer = gl.createBuffer();
+                    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+                    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+                    const location = gl.getAttribLocation(program, name);
+                    gl.vertexAttribPointer(location, itemSize, gl.FLOAT, false, 0, 0);
+                    return location;
+                }
+
+                static fillIntVertexArray(name, data, itemSize) {
+                    const location = gl.getAttribLocation(program, name);
+                    gl.vertexAttribI4i(location, 0, 0, 0, 0);
+                    if (!data) {
+                        return -1;
+                    }
+                    const buffer = gl.createBuffer();
+                    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+                    gl.bufferData(gl.ARRAY_BUFFER, new Int32Array(data), gl.STATIC_DRAW);
+                    gl.vertexAttribIPointer(location, itemSize, gl.INT, 0, 0);
+                    return location;
+                }
+
+                render(boneInverseMatrices, boneWorldMatrices) {
+                    gl.bindVertexArray(this.vertexArray);
+                    gl.enableVertexAttribArray(this.positionLocation);
+                    if (this.uvLocation !== -1) {
+                        gl.enableVertexAttribArray(this.uvLocation);
+                    }
+                    if (this.colorLocation !== -1) {
+                        gl.enableVertexAttribArray(this.colorLocation);
+                        gl.uniform1i(hasVertexColorUniform, 1);
+                    } else {
+                        gl.uniform1i(hasVertexColorUniform, 0);
+                    }
+                    if (this.skinIndexLocation !== -1 && this.skinWeightLocation !== -1 && boneInverseMatrices && boneWorldMatrices) {
+                        gl.uniform1i(hasBonesUniform, 1);
+                        gl.enableVertexAttribArray(this.skinIndexLocation);
+                        gl.enableVertexAttribArray(this.skinWeightLocation);
+                        if (!this.boneMatrices) {
+                            this.boneMatrices = [];
+                            this.boneMatrixCache = mat4.create();
+                        }
+                        for (let i = 0; i < boneInverseMatrices.length; i++) {
+                            mat4.identity(this.boneMatrixCache);
+                            mat4.multiply(this.boneMatrixCache, this.boneMatrixCache, boneWorldMatrices[i]);
+                            mat4.multiply(this.boneMatrixCache, this.boneMatrixCache, boneInverseMatrices[i]);
+                            for (let j = 0; j < 16; j++) {
+                                this.boneMatrices[i * 16 + j] = this.boneMatrixCache[j];
+                            }
+                        }
+                        gl.uniformMatrix4fv(boneMatricesUniform, false, this.boneMatrices);
+                    } else {
+                        gl.uniform1i(hasBonesUniform, 0);
+                    }
+                    gl.drawElements(gl.TRIANGLES, this.indexCount, gl.UNSIGNED_SHORT, 0);
+                }
+            }
+
+            class Texture {
+                constructor(gltfTexture) {
+                    const texture = gl.createTexture();
+                    gl.bindTexture(gl.TEXTURE_2D, texture);
+                    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gltfTexture.image);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+                    this.texture = texture;
+                }
+            }
+
+            class Material {
+                constructor(gltfMaterial) {
+                    const c = gltfMaterial.color;
+                    this.color = [c.r, c.g, c.b, 1];
+                    this.texture = gltfMaterial.map ? new Texture(gltfMaterial.map) : null;
+                    this.transparent = gltfMaterial.transparent;
+                    this.alphaTest = gltfMaterial.alphaTest;
+                    this.gltfMaterial = gltfMaterial;
+                    this.disableDepthTest = false;
+                }
+
+                apply(transparent) {
+                    gl.uniform4fv(colorUniform, this.color);
+                    gl.activeTexture(gl.TEXTURE0);
+                    if (this.texture) {
+                        gl.bindTexture(gl.TEXTURE_2D, this.texture.texture);
+                        gl.uniform1i(hasTextureUniform, 1);
+                    } else {
+                        gl.uniform1i(hasTextureUniform, 0);
+                    }
+                    gl.uniform1i(textureUniform, 0);
+
+                    if (transparent) {
+                        gl.enable(gl.BLEND);
+                        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+                    } else {
+                        gl.disable(gl.BLEND);
+                    }
+                    if (transparent) {
+                        gl.uniform1f(minAlphaUniform, 0);
+                        gl.uniform1f(maxAlphaUniform, 0.99);
+                    } else if (this.transparent) {
+                        gl.uniform1f(minAlphaUniform, 0.99);
+                        gl.uniform1f(maxAlphaUniform, 1);
+                    } else {
+                        gl.uniform1f(minAlphaUniform, this.alphaTest);
+                        gl.uniform1f(maxAlphaUniform, 1);
+                    }
+                    if (this.disableDepthTest) {
+                        gl.disable(gl.DEPTH_TEST);
+                    } else {
+                        gl.enable(gl.DEPTH_TEST);
+                    }
+                }
+
+                clone() {
+                    const material = new Material(this.gltfMaterial);
+                    material.transparent = true;
+                    material.disableDepthTest = true;
+                    return material;
+                }
+            }
+
+            class Node {
+                constructor(parent) {
+                    this.parent = parent;
+                    this.children = [];
+                    this.position = vec3.create();
+                    this.rotation = quat.create();
+                    this.scale = vec3.set(vec3.create(), 1, 1, 1);
+                    this.localMatrix = mat4.create();
+                    this.worldMatrix = mat4.create();
+                    if (parent) {
+                        parent.children.push(this);
+                    }
+                }
+
+                render(transparent) {
+                    if (this.gltfObject) {
+                        vec3.set(this.position, this.gltfObject.position.x, this.gltfObject.position.y, this.gltfObject.position.z);
+                        quat.set(
+                            this.rotation,
+                            this.gltfObject.quaternion.x,
+                            this.gltfObject.quaternion.y,
+                            this.gltfObject.quaternion.z,
+                            this.gltfObject.quaternion.w
+                        );
+                        vec3.set(this.scale, this.gltfObject.scale.x, this.gltfObject.scale.y, this.gltfObject.scale.z);
+                    }
+
+                    mat4.fromRotationTranslationScale(this.localMatrix, this.rotation, this.position, this.scale);
+                    if (this.parent) {
+                        mat4.multiply(this.worldMatrix, this.parent.worldMatrix, this.localMatrix);
+                    } else {
+                        mat4.copy(this.worldMatrix, this.localMatrix);
+                    }
+
+                    for (let child of this.children) {
+                        child.render(transparent);
+                    }
+                }
+
+                cloneMesh(parent) {
+                    for (let child of this.children) {
+                        const mesh = child.cloneMesh(parent);
+                        if (mesh) {
+                            return mesh;
+                        }
+                    }
+                    return null;
+                }
+            }
+
+            class Mesh extends Node {
+                constructor(parent, geometry, material) {
+                    super(parent);
+                    this.geometry = geometry;
+                    this.material = material;
+                }
+
+                render(transparent) {
+                    super.render(transparent);
+                    gl.useProgram(program);
+                    if (!transparent || this.material.transparent) {
+                        gl.uniformMatrix4fv(modelUniform, false, this.worldMatrix);
+                        this.material.apply(transparent);
+                        if (this.gltfObject instanceof THREE.SkinnedMesh) {
+                            this.geometry.render(
+                                this.gltfObject.skeleton.boneInverses.map((m) => m.elements),
+                                this.gltfObject.skeleton.bones.map((b) => b.mynode.worldMatrix)
+                            );
+                        } else {
+                            this.geometry.render();
+                        }
+                    }
+                }
+
+                cloneMesh(parent) {
+                    const material = this.material.clone();
+                    material.transparent = true;
+                    material.color = [1, 0, 0, 0.9];
+                    const mesh = new Mesh(parent, this.geometry, material);
+                    return mesh;
+                }
+            }
+
+            const zNear = 0.1;
+            const zFar = 100;
+            const projection = mat4.perspective(mat4.create(), Math.PI / 3, 1, zNear, zFar);
+            let cameraPitch = 0;
+            let cameraYaw = 0;
+            let cameraDistance = 3;
+            function updateViewMatrix(view) {
+                mat4.identity(view);
+                mat4.rotateY(view, view, cameraYaw);
+                mat4.rotateX(view, view, cameraPitch);
+                mat4.translate(view, view, [0, 0, cameraDistance]);
+                mat4.invert(view, view);
+                return view;
+            }
+            const view = updateViewMatrix(mat4.create());
+
+            gl.uniformMatrix4fv(projectionUniform, false, projection);
+            gl.uniformMatrix4fv(viewUniform, false, view);
+
+            let root = new Node();
+
+            let time = Date.now();
+            function render() {
+                if (root.mixer) {
+                    const currentTime = Date.now();
+                    const deltaTime = currentTime - time;
+                    root.mixer.update(deltaTime / 1000);
+                    time = currentTime;
+                }
+
+                if (gl.canvas.width != gl.canvas.clientWidth || gl.canvas.height != gl.canvas.clientHeight) {
+                    const w = (gl.canvas.width = gl.canvas.clientWidth);
+                    const h = (gl.canvas.height = gl.canvas.clientHeight);
+                    mat4.perspective(projection, Math.PI / 3, w / h, zNear, zFar);
+                    gl.uniformMatrix4fv(projectionUniform, false, projection);
+                    gl.viewport(0, 0, w, h);
+                }
+
+                gl.clearColor(0, 0, 0, 1);
+                gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+                gl.enable(gl.DEPTH_TEST);
+                gl.enable(gl.CULL_FACE);
+
+                root.render(false);
+                root.render(true);
+
+                setTimeout(render, 1000 / 60);
+            }
+            render();
+
+            let mouseDown = false;
+            let mouseStartX = 0;
+            let mouseStartY = 0;
+            let mouseButton = 0;
+            document.addEventListener('mousedown', (e) => {
+                mouseDown = true;
+                mouseStartX = e.x;
+                mouseStartY = e.y;
+                mouseButton = e.button;
+            });
+            document.addEventListener('mousemove', (e) => {
+                if (mouseDown) {
+                    const offsetX = e.x - mouseStartX;
+                    const offsetY = e.y - mouseStartY;
+                    if (mouseButton === 0) {
+                        cameraYaw -= (offsetX / 512) * Math.PI;
+                        cameraPitch -= (offsetY / 512) * Math.PI;
+                        cameraPitch = Math.min(cameraPitch, Math.PI / 2);
+                        cameraPitch = Math.max(cameraPitch, -Math.PI / 2);
+                        updateViewMatrix(view);
+                        gl.uniformMatrix4fv(viewUniform, false, view);
+                    } else {
+                        const viewTranslation = [offsetX / 512, -offsetY / 512, 0];
+                        const worldToView = mat4.getRotation(quat.create(), view);
+                        const viewToWorld = quat.invert(quat.create(), worldToView);
+                        const worldTranslation = vec3.transformQuat(vec3.create(), viewTranslation, viewToWorld);
+                        vec3.add(root.position, root.position, worldTranslation);
+                    }
+                    mouseStartX = e.x;
+                    mouseStartY = e.y;
+                }
+            });
+            document.addEventListener('mouseup', (e) => {
+                mouseDown = false;
+            });
+            document.addEventListener('wheel', (e) => {
+                const scale = 1 - event.deltaY / 1000;
+                vec3.multiply(root.scale, root.scale, [scale, scale, scale]);
+            });
+            document.addEventListener('contextmenu', (event) => event.preventDefault());
+
+            let boneIndicator = null;
+
+            class GltfModelBuilder {
+                constructor(gltf) {
+                    this.gltf = gltf;
+                }
+
+                build() {
+                    const root = new Node();
+                    this._build(root, this.gltf.scene);
+                    if (this.gltf.animations.length > 0) {
+                        root.animationIndex = 0;
+                        root.animations = this.gltf.animations;
+
+                        const mixer = new THREE.AnimationMixer(this.gltf.scene);
+                        const action = mixer.clipAction(this.gltf.animations[0]);
+                        action.clampWhenFinished = true;
+                        action.play();
+                        root.mixer = mixer;
+                    }
+                    return root;
+                }
+
+                _build(parent, gltfObject) {
+                    if (gltfObject instanceof THREE.Mesh) {
+                        const geometry = new Geometry(gltfObject.geometry);
+                        const material = new Material(gltfObject.material);
+                        const mesh = new Mesh(parent, geometry, material);
+                        mesh.position = gltfObject.position.toArray();
+                        mesh.rotation = gltfObject.quaternion.toArray();
+                        mesh.scale = gltfObject.scale.toArray();
+                        mesh.gltfObject = gltfObject;
+                        gltfObject.mynode = mesh;
+                        return mesh;
+                    }
+                    const node = new Node(parent);
+                    node.position = gltfObject.position.toArray();
+                    node.rotation = gltfObject.quaternion.toArray();
+                    node.scale = gltfObject.scale.toArray();
+                    node.gltfObject = gltfObject;
+                    for (let child of gltfObject.children) {
+                        this._build(node, child);
+                    }
+                    if (boneIndicator && gltfObject instanceof THREE.Bone) {
+                        // TODO: Comment out to add bones.
+                        // boneIndicator.cloneMesh(node);
+                    }
+                    gltfObject.mynode = node;
+                    return node;
+                }
+            }
+
+            const models = [
+                'examples/Box/glTF/Box.gltf',
+                'examples/BoxVertexColors/glTF/BoxVertexColors.gltf',
+                'examples/BoxTextured/glTF/BoxTextured.gltf',
+                ['examples/One Piece Marine Ship/gltf.gltf', 0.01],
+                ['examples/DBZ - Goku/gltf.gltf', 0.75],
+                ['https://github.khronos.org/glTF-Sample-Viewer-Release/assets/models/2.0/RiggedSimple/glTF/RiggedSimple.gltf', 0.25],
+                'https://threejs.org/examples/models/gltf/Soldier.glb',
+                ['examples/Chibi Rai/gltf.gltf', 0.075],
+                ['examples/Slimes & Bees/gltf.gltf', 0.2],
+                ['https://threejs.org/examples/models/gltf/LittlestTokyo.glb', 0.01],
+            ];
+
+            let index = 0;
+            function loadModel() {
+                const name = Array.isArray(models[index]) ? models[index][0] : models[index];
+                const scale = Array.isArray(models[index]) ? models[index][1] : 1;
+                newGltfLoader().load(name, (gltf) => {
+                    root = new GltfModelBuilder(gltf).build();
+                    vec3.multiply(root.scale, root.scale, [scale, scale, scale]);
+                });
+            }
+
+            newGltfLoader().load('examples/Box/glTF/Box.gltf', (gltf) => {
+                boneIndicator = new GltfModelBuilder(gltf).build();
+                loadModel();
+
+                const select = document.getElementById('model-selection');
+                for (let i = 0; i < models.length; i++) {
+                    const option = document.createElement('option');
+                    option.setAttribute('value', i);
+                    option.innerText = models[i];
+                    select.appendChild(option);
+                }
+                select.addEventListener('change', (e) => {
+                    index = parseInt(e.target.value);
+                    loadModel();
+                });
+            });
+
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'n') {
+                    index = (index + 1) % models.length;
+                    loadModel();
+                } else if (e.key === 'm') {
+                    if (root.animations) {
+                        root.mixer.stopAllAction();
+                        const index = (root.animationIndex + 1) % root.animations.length;
+                        const action = root.mixer.clipAction(root.animations[index]);
+                        action.play();
+                        root.animationIndex = index;
+                    }
+                }
+            });
+        </script>
+    </body>
+</html>
