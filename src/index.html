@@ -7,35 +7,27 @@
             precision highp float;
 
             in vec3 a_position;
+            in vec3 a_normal;
             in vec2 a_uv;
             in vec4 a_vertex_color;
-            in vec4 a_skin_weight;
-            in ivec4 a_skin_index;
 
+            out vec3 v_normal;
             out vec2 v_uv;
             out vec4 v_vertex_color;
+            out vec3 v_pos;
+            out vec3 v_camera_position;
 
             uniform mat4 u_projection;
             uniform mat4 u_view;
             uniform mat4 u_model;
 
-            uniform bool u_has_bones;
-            uniform mat4 u_bone_matrices[128];
-
             void main() {
-                vec4 world_position;
-                if (u_has_bones) {
-                    vec4 sum = vec4(0);
-                    for (int i = 0; i < 4; i++) {
-                        int bone_index = a_skin_index[i];
-                        float bone_weight = a_skin_weight[i];
-                        sum += u_bone_matrices[bone_index] * vec4(a_position, 1) * bone_weight;
-                    }
-                    world_position = sum;
-                } else {
-                    world_position = u_model * vec4(a_position, 1);
-                }
-                gl_Position = u_projection * u_view * world_position;
+                vec4 world_position = u_model * vec4(a_position, 1);
+                vec4 view_position = u_view * world_position;
+                v_camera_position = (inverse(u_view) * vec4(0, 0, 0, 1)).xyz;
+                v_pos = world_position.xyz;
+                gl_Position = u_projection * view_position;
+                v_normal = mat3(u_model) * a_normal;
                 v_uv = a_uv;
                 v_vertex_color = a_vertex_color;
             }
@@ -45,8 +37,11 @@
 
             precision highp float;
 
+            in vec3 v_normal;
             in vec2 v_uv;
             in vec4 v_vertex_color;
+            in vec3 v_pos;
+            in vec3 v_camera_position;
 
             out vec4 g_color;
 
@@ -55,11 +50,17 @@
             uniform vec4 u_color;
             uniform bool u_has_texture;
             uniform sampler2D u_texture;
-
-            uniform float u_min_alpha;
-            uniform float u_max_alpha;
+            uniform vec3 u_lighting_position;
+            uniform float u_specular_amount;
+            uniform vec3 u_light_color;
+            uniform vec3 u_ambient_color;
 
             void main() {
+                // normalize(vec3): vec3
+                // dot(vec3, vec3): float
+                // length(vec3): float
+                // reflect(vec3, vec3): vec3
+                // pow(float, float): float
                 vec4 color = u_color;
                 if (u_has_vertex_color) {
                     color *= v_vertex_color;
@@ -67,13 +68,23 @@
                 if (u_has_texture) {
                     color *= texture(u_texture, v_uv);
                 }
-                if (color.w < u_min_alpha || color.w > u_max_alpha) {
-                    discard;
-                }
-                g_color = color;
+                vec3 normal = normalize(v_normal);
+                vec3 light_direction = u_lighting_position - v_pos;
+                vec3 normalized_light_direction = normalize(light_direction);
+                vec3 view_direction = v_camera_position - v_pos;
+                vec3 normalized_view_direction = normalize(view_direction);
+                vec3 reflect_direction = reflect(-normalized_light_direction, normal);
+
+                float diffuse = max(0.0, dot(normal, normalized_light_direction));
+                float specular = pow(max(0.0, dot(reflect_direction, normalized_view_direction)), u_specular_amount);
+                g_color = vec4((u_ambient_color + (diffuse + specular) * u_light_color) * color.rgb, 1.0);
+                // g_color = vec4(v_normal, 1.0);
             }
         </script>
+        <script src="https://flyover.github.io/imgui-js/dist/imgui.umd.js"></script>
+        <script src="https://flyover.github.io/imgui-js/dist/imgui_impl.umd.js"></script>
     </head>
+
     <body>
         <canvas id="canvas" style="width: 100%; height: 100%"></canvas>
         <div style="position: absolute; left: 0; top: 0">
@@ -98,10 +109,11 @@
             const hasVertexColorUniform = gl.getUniformLocation(program, 'u_has_vertex_color');
             const hasTextureUniform = gl.getUniformLocation(program, 'u_has_texture');
             const textureUniform = gl.getUniformLocation(program, 'u_texture');
-            const minAlphaUniform = gl.getUniformLocation(program, 'u_min_alpha');
-            const maxAlphaUniform = gl.getUniformLocation(program, 'u_max_alpha');
-            const hasBonesUniform = gl.getUniformLocation(program, 'u_has_bones');
-            const boneMatricesUniform = gl.getUniformLocation(program, 'u_bone_matrices');
+            const lightingPositionUniform = gl.getUniformLocation(program, 'u_lighting_position');
+            const specularAmountUniform = gl.getUniformLocation(program, 'u_specular_amount');
+            const lightcolorUniform = gl.getUniformLocation(program, 'u_light_color');
+            const ambientcolorUniform = gl.getUniformLocation(program, 'u_ambient_color');
+            // TODO: get light uniform locations.
             gl.useProgram(program);
 
             class Geometry {
@@ -111,34 +123,30 @@
                     gl.bindVertexArray(vertexArray);
 
                     const positionLocation = Geometry.fillFloatVertexArray('a_position', gltfBufferToArray(gltfGeometry.attributes.position), 3);
+                    const normalLocation = Geometry.fillFloatVertexArray('a_normal', gltfBufferToArray(gltfGeometry.attributes.normal), 3);
                     const uvLocation = Geometry.fillFloatVertexArray('a_uv', gltfBufferToArray(gltfGeometry.attributes.uv), 2);
                     const colorLocation = Geometry.fillFloatVertexArray('a_vertex_color', gltfBufferToArray(gltfGeometry.attributes.color), 4);
-                    const skinIndexLocation = Geometry.fillIntVertexArray('a_skin_index', gltfBufferToArray(gltfGeometry.attributes.skinIndex), 4);
-                    const skinWeightLocation = Geometry.fillFloatVertexArray(
-                        'a_skin_weight',
-                        gltfBufferToArray(gltfGeometry.attributes.skinWeight),
-                        4
-                    );
 
                     // Indices.
                     const indexBuffer = gl.createBuffer();
                     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
                     const indices = gltfBufferToArray(gltfGeometry.index);
                     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+                    console.log('index array', indices);
 
                     this.vertexArray = vertexArray;
                     this.indexCount = indices.length;
                     this.positionLocation = positionLocation;
+                    this.normalLocation = normalLocation;
                     this.uvLocation = uvLocation;
                     this.colorLocation = colorLocation;
-                    this.skinIndexLocation = skinIndexLocation;
-                    this.skinWeightLocation = skinWeightLocation;
                 }
 
                 static fillFloatVertexArray(name, data, itemSize) {
                     if (!data) {
                         return -1;
                     }
+                    console.log('array', name, data);
                     const buffer = gl.createBuffer();
                     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
                     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
@@ -160,9 +168,10 @@
                     return location;
                 }
 
-                render(boneInverseMatrices, boneWorldMatrices) {
+                render() {
                     gl.bindVertexArray(this.vertexArray);
                     gl.enableVertexAttribArray(this.positionLocation);
+                    gl.enableVertexAttribArray(this.normalLocation);
                     if (this.uvLocation !== -1) {
                         gl.enableVertexAttribArray(this.uvLocation);
                     }
@@ -171,26 +180,6 @@
                         gl.uniform1i(hasVertexColorUniform, 1);
                     } else {
                         gl.uniform1i(hasVertexColorUniform, 0);
-                    }
-                    if (this.skinIndexLocation !== -1 && this.skinWeightLocation !== -1 && boneInverseMatrices && boneWorldMatrices) {
-                        gl.uniform1i(hasBonesUniform, 1);
-                        gl.enableVertexAttribArray(this.skinIndexLocation);
-                        gl.enableVertexAttribArray(this.skinWeightLocation);
-                        if (!this.boneMatrices) {
-                            this.boneMatrices = [];
-                            this.boneMatrixCache = mat4.create();
-                        }
-                        for (let i = 0; i < boneInverseMatrices.length; i++) {
-                            mat4.identity(this.boneMatrixCache);
-                            mat4.multiply(this.boneMatrixCache, this.boneMatrixCache, boneWorldMatrices[i]);
-                            mat4.multiply(this.boneMatrixCache, this.boneMatrixCache, boneInverseMatrices[i]);
-                            for (let j = 0; j < 16; j++) {
-                                this.boneMatrices[i * 16 + j] = this.boneMatrixCache[j];
-                            }
-                        }
-                        gl.uniformMatrix4fv(boneMatricesUniform, false, this.boneMatrices);
-                    } else {
-                        gl.uniform1i(hasBonesUniform, 0);
                     }
                     gl.drawElements(gl.TRIANGLES, this.indexCount, gl.UNSIGNED_SHORT, 0);
                 }
@@ -216,11 +205,9 @@
                     this.texture = gltfMaterial.map ? new Texture(gltfMaterial.map) : null;
                     this.transparent = gltfMaterial.transparent;
                     this.alphaTest = gltfMaterial.alphaTest;
-                    this.gltfMaterial = gltfMaterial;
-                    this.disableDepthTest = false;
                 }
 
-                apply(transparent) {
+                apply() {
                     gl.uniform4fv(colorUniform, this.color);
                     gl.activeTexture(gl.TEXTURE0);
                     if (this.texture) {
@@ -230,35 +217,6 @@
                         gl.uniform1i(hasTextureUniform, 0);
                     }
                     gl.uniform1i(textureUniform, 0);
-
-                    if (transparent) {
-                        gl.enable(gl.BLEND);
-                        gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-                    } else {
-                        gl.disable(gl.BLEND);
-                    }
-                    if (transparent) {
-                        gl.uniform1f(minAlphaUniform, 0);
-                        gl.uniform1f(maxAlphaUniform, 0.99);
-                    } else if (this.transparent) {
-                        gl.uniform1f(minAlphaUniform, 0.99);
-                        gl.uniform1f(maxAlphaUniform, 1);
-                    } else {
-                        gl.uniform1f(minAlphaUniform, this.alphaTest);
-                        gl.uniform1f(maxAlphaUniform, 1);
-                    }
-                    if (this.disableDepthTest) {
-                        gl.disable(gl.DEPTH_TEST);
-                    } else {
-                        gl.enable(gl.DEPTH_TEST);
-                    }
-                }
-
-                clone() {
-                    const material = new Material(this.gltfMaterial);
-                    material.transparent = true;
-                    material.disableDepthTest = true;
-                    return material;
                 }
             }
 
@@ -266,9 +224,9 @@
                 constructor(parent) {
                     this.parent = parent;
                     this.children = [];
-                    this.position = vec3.create();
-                    this.rotation = quat.create();
-                    this.scale = vec3.set(vec3.create(), 1, 1, 1);
+                    this.position = [0, 0, 0];
+                    this.rotation = [0, 0, 0, 1];
+                    this.scale = [1, 1, 1];
                     this.localMatrix = mat4.create();
                     this.worldMatrix = mat4.create();
                     if (parent) {
@@ -276,7 +234,7 @@
                     }
                 }
 
-                render(transparent) {
+                render() {
                     if (this.gltfObject) {
                         vec3.set(this.position, this.gltfObject.position.x, this.gltfObject.position.y, this.gltfObject.position.z);
                         quat.set(
@@ -297,18 +255,8 @@
                     }
 
                     for (let child of this.children) {
-                        child.render(transparent);
+                        child.render();
                     }
-                }
-
-                cloneMesh(parent) {
-                    for (let child of this.children) {
-                        const mesh = child.cloneMesh(parent);
-                        if (mesh) {
-                            return mesh;
-                        }
-                    }
-                    return null;
                 }
             }
 
@@ -319,29 +267,12 @@
                     this.material = material;
                 }
 
-                render(transparent) {
-                    super.render(transparent);
+                render() {
+                    super.render();
                     gl.useProgram(program);
-                    if (!transparent || this.material.transparent) {
-                        gl.uniformMatrix4fv(modelUniform, false, this.worldMatrix);
-                        this.material.apply(transparent);
-                        if (this.gltfObject instanceof THREE.SkinnedMesh) {
-                            this.geometry.render(
-                                this.gltfObject.skeleton.boneInverses.map((m) => m.elements),
-                                this.gltfObject.skeleton.bones.map((b) => b.mynode.worldMatrix)
-                            );
-                        } else {
-                            this.geometry.render();
-                        }
-                    }
-                }
-
-                cloneMesh(parent) {
-                    const material = this.material.clone();
-                    material.transparent = true;
-                    material.color = [1, 0, 0, 0.9];
-                    const mesh = new Mesh(parent, this.geometry, material);
-                    return mesh;
+                    gl.uniformMatrix4fv(modelUniform, false, this.worldMatrix);
+                    this.material.apply();
+                    this.geometry.render();
                 }
             }
 
@@ -360,47 +291,124 @@
                 return view;
             }
             const view = updateViewMatrix(mat4.create());
+            function getOrSetCameraPitch(value) {
+                if (value == null) {
+                    return cameraPitch;
+                }
+                cameraPitch = value;
+                updateViewMatrix(view);
+                return cameraPitch;
+            }
+            function getOrSetCameraYaw(value) {
+                if (value == null) {
+                    return cameraYaw;
+                }
+                cameraYaw = value;
+                updateViewMatrix(view);
+                return cameraYaw;
+            }
 
             gl.uniformMatrix4fv(projectionUniform, false, projection);
             gl.uniformMatrix4fv(viewUniform, false, view);
 
             let root = new Node();
 
-            let time = Date.now();
-            function render() {
-                if (root.mixer) {
-                    const currentTime = Date.now();
-                    const deltaTime = currentTime - time;
-                    root.mixer.update(deltaTime / 1000);
-                    time = currentTime;
+            const lightPosition = [0, 10, 0];
+            const lightDirection = [0, -1, 0];
+            const lightColor = [1, 1, 1];
+            const ambientColor = [0.25, 0.25, 0.25];
+            let specularAmount = 32;
+            function getOrSetSpecularAmount(value) {
+                if (value == null) {
+                    return specularAmount;
                 }
+                specularAmount = value;
+                return specularAmount;
+            }
 
+            let lastAspectRatio = 1;
+            function render(time) {
                 if (gl.canvas.width != gl.canvas.clientWidth || gl.canvas.height != gl.canvas.clientHeight) {
                     const w = (gl.canvas.width = gl.canvas.clientWidth);
                     const h = (gl.canvas.height = gl.canvas.clientHeight);
-                    mat4.perspective(projection, Math.PI / 3, w / h, zNear, zFar);
-                    gl.uniformMatrix4fv(projectionUniform, false, projection);
                     gl.viewport(0, 0, w, h);
                 }
+                let currentAspectRatio = gl.canvas.width / gl.canvas.height;
+                if (currentAspectRatio !== lastAspectRatio) {
+                    lastAspectRatio = currentAspectRatio;
+                    mat4.perspective(projection, Math.PI / 3, lastAspectRatio, zNear, zFar);
+                    gl.uniformMatrix4fv(projectionUniform, false, projection);
+                }
 
+                gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
                 gl.clearColor(0, 0, 0, 1);
                 gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
                 gl.enable(gl.DEPTH_TEST);
-                gl.enable(gl.CULL_FACE);
 
-                root.render(false);
-                root.render(true);
+                gl.useProgram(program);
+                gl.uniformMatrix4fv(viewUniform, false, view);
 
-                setTimeout(render, 1000 / 60);
+                // TODO: Set light uniforms.
+                gl.uniform3fv(lightingPositionUniform, lightPosition);
+
+                gl.uniform1f(specularAmountUniform, specularAmount);
+                gl.uniform3fv(lightcolorUniform, lightColor);
+                gl.uniform3fv(ambientcolorUniform, ambientColor);
+
+                root.render();
+
+                // UI
+                ImGui_Impl.NewFrame(time);
+                ImGui.NewFrame();
+                ImGui.SetNextWindowPos(new ImGui.ImVec2(4, 24), ImGui.Always);
+                ImGui.Begin('Default', null, ImGui.WindowFlags.NoTitleBar | ImGui.WindowFlags.NoResize | ImGui.WindowFlags.AlwaysAutoResize);
+                if (ImGui.Button('Reset')) {
+                    cameraPitch = 0;
+                    cameraYaw = 0;
+                    updateViewMatrix(view);
+                    vec3.set(root.position, 0, 0, 0);
+                    vec3.set(root.scale, 1, 1, 1);
+                    vec3.set(lightPosition, 0, 10, 0);
+                    vec3.set(lightDirection, 0, -1, 0);
+                    vec3.set(lightColor, 1, 1, 1);
+                    vec3.set(ambientColor, 0.25, 0.25, 0.25);
+                }
+                ImGui.Text('Camera');
+                ImGui.SliderFloat('pitch##camera', getOrSetCameraPitch, -Math.PI / 2, Math.PI / 2);
+                ImGui.SliderFloat('yaw##camera', getOrSetCameraYaw, -Math.PI, Math.PI);
+                ImGui.Text('Model');
+                ImGui.DragFloat3('position##model', root.position, 0.01);
+                ImGui.DragFloat3('scale##model', root.scale, 0.01);
+                ImGui.Text('Light');
+                ImGui.DragFloat3('position##light', lightPosition, 0.1);
+                ImGui.DragFloat3('direction##light', lightDirection, 0.1);
+                ImGui.ColorEdit3('light color##light', lightColor);
+                ImGui.ColorEdit3('ambient color##light', ambientColor);
+                ImGui.SliderFloat('specular amount##light', getOrSetSpecularAmount, 0, 128);
+                ImGui.End();
+                ImGui.EndFrame();
+                ImGui.Render();
+                ImGui_Impl.RenderDrawData(ImGui.GetDrawData());
+
+                window.requestAnimationFrame(render);
             }
-            render();
+            async function startImGui() {
+                await ImGui.default();
+                ImGui.CreateContext();
+                ImGui_Impl.Init(canvas);
+                window.requestAnimationFrame(render);
+            }
+            startImGui();
 
             let mouseDown = false;
             let mouseStartX = 0;
             let mouseStartY = 0;
             let mouseButton = 0;
             document.addEventListener('mousedown', (e) => {
+                if (ImGui.GetIO().WantCaptureMouse) {
+                    return;
+                }
                 mouseDown = true;
                 mouseStartX = e.x;
                 mouseStartY = e.y;
@@ -432,12 +440,13 @@
                 mouseDown = false;
             });
             document.addEventListener('wheel', (e) => {
+                if (ImGui.GetIO().WantCaptureMouse) {
+                    return;
+                }
                 const scale = 1 - event.deltaY / 1000;
                 vec3.multiply(root.scale, root.scale, [scale, scale, scale]);
             });
             document.addEventListener('contextmenu', (event) => event.preventDefault());
-
-            let boneIndicator = null;
 
             class GltfModelBuilder {
                 constructor(gltf) {
@@ -447,16 +456,6 @@
                 build() {
                     const root = new Node();
                     this._build(root, this.gltf.scene);
-                    if (this.gltf.animations.length > 0) {
-                        root.animationIndex = 0;
-                        root.animations = this.gltf.animations;
-
-                        const mixer = new THREE.AnimationMixer(this.gltf.scene);
-                        const action = mixer.clipAction(this.gltf.animations[0]);
-                        action.clampWhenFinished = true;
-                        action.play();
-                        root.mixer = mixer;
-                    }
                     return root;
                 }
 
@@ -480,10 +479,6 @@
                     for (let child of gltfObject.children) {
                         this._build(node, child);
                     }
-                    if (boneIndicator && gltfObject instanceof THREE.Bone) {
-                        // TODO: Comment out to add bones.
-                        // boneIndicator.cloneMesh(node);
-                    }
                     gltfObject.mynode = node;
                     return node;
                 }
@@ -493,13 +488,8 @@
                 'examples/Box/glTF/Box.gltf',
                 'examples/BoxVertexColors/glTF/BoxVertexColors.gltf',
                 'examples/BoxTextured/glTF/BoxTextured.gltf',
+                'https://github.khronos.org/glTF-Sample-Viewer-Release/assets/models/2.0/Duck/glTF/Duck.gltf',
                 ['examples/One Piece Marine Ship/gltf.gltf', 0.01],
-                ['examples/DBZ - Goku/gltf.gltf', 0.75],
-                ['https://github.khronos.org/glTF-Sample-Viewer-Release/assets/models/2.0/RiggedSimple/glTF/RiggedSimple.gltf', 0.25],
-                'https://threejs.org/examples/models/gltf/Soldier.glb',
-                ['examples/Chibi Rai/gltf.gltf', 0.075],
-                ['examples/Slimes & Bees/gltf.gltf', 0.2],
-                ['https://threejs.org/examples/models/gltf/LittlestTokyo.glb', 0.01],
             ];
 
             let index = 0;
@@ -512,36 +502,18 @@
                 });
             }
 
-            newGltfLoader().load('examples/Box/glTF/Box.gltf', (gltf) => {
-                boneIndicator = new GltfModelBuilder(gltf).build();
+            loadModel();
+
+            const select = document.getElementById('model-selection');
+            for (let i = 0; i < models.length; i++) {
+                const option = document.createElement('option');
+                option.setAttribute('value', i);
+                option.innerText = models[i];
+                select.appendChild(option);
+            }
+            select.addEventListener('change', (e) => {
+                index = parseInt(e.target.value);
                 loadModel();
-
-                const select = document.getElementById('model-selection');
-                for (let i = 0; i < models.length; i++) {
-                    const option = document.createElement('option');
-                    option.setAttribute('value', i);
-                    option.innerText = models[i];
-                    select.appendChild(option);
-                }
-                select.addEventListener('change', (e) => {
-                    index = parseInt(e.target.value);
-                    loadModel();
-                });
-            });
-
-            document.addEventListener('keydown', (e) => {
-                if (e.key === 'n') {
-                    index = (index + 1) % models.length;
-                    loadModel();
-                } else if (e.key === 'm') {
-                    if (root.animations) {
-                        root.mixer.stopAllAction();
-                        const index = (root.animationIndex + 1) % root.animations.length;
-                        const action = root.mixer.clipAction(root.animations[index]);
-                        action.play();
-                        root.animationIndex = index;
-                    }
-                }
             });
         </script>
     </body>
